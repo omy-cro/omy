@@ -1,70 +1,85 @@
-import Stripe from "stripe";
 import { NextResponse } from "next/server";
+import { stripe } from "@/lib/stripe";
 
 export const runtime = "nodejs";
 
-function safeDecode(value: string | null) {
+const PRICE_IDS = {
+  1: process.env.STRIPE_PRICE_1,
+  5: process.env.STRIPE_PRICE_5,
+  10: process.env.STRIPE_PRICE_10,
+  100: process.env.STRIPE_PRICE_100,
+} as const;
+
+function cleanHeader(value: string | null) {
   if (!value) return "";
-  try { return decodeURIComponent(value).slice(0, 100); } catch { return value.slice(0, 100); }
+  try { return decodeURIComponent(value).slice(0, 120); }
+  catch { return value.slice(0, 120); }
 }
 
-function coarseCoord(value: string | null) {
+function roundedCoordinate(value: string | null) {
   if (!value) return "";
   const n = Number(value);
-  if (!Number.isFinite(n)) return "";
-  return (Math.round(n * 10) / 10).toFixed(1);
+  return Number.isFinite(n) ? n.toFixed(1) : "";
 }
 
 export async function POST(request: Request) {
   try {
-    const secret = process.env.STRIPE_SECRET_KEY;
-    const siteUrl = process.env.NEXT_PUBLIC_SITE_URL;
-    if (!secret || !siteUrl) {
-      return NextResponse.json({ error: "Server is not configured." }, { status: 500 });
+    const body = await request.json();
+    const amount = body?.amount;
+    const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || "https://onemillionyes.com";
+    let lineItems;
+
+    if (amount === "custom") {
+      const cents = Number(body?.customAmountCents);
+      if (!Number.isInteger(cents) || cents < 100 || cents > 10_000_000) {
+        return NextResponse.json({ error: "Custom amount must be between €1 and €100,000." }, { status: 400 });
+      }
+      lineItems = [{
+        price_data: {
+          currency: "eur",
+          product_data: {
+            name: "One Million Yes",
+            description: "Voluntary participation in a global social experiment. No product, service or reward in return.",
+          },
+          unit_amount: cents,
+        },
+        quantity: 1,
+      }];
+    } else {
+      const numericAmount = Number(amount) as 1 | 5 | 10 | 100;
+      if (![1, 5, 10, 100].includes(numericAmount)) {
+        return NextResponse.json({ error: "Invalid amount." }, { status: 400 });
+      }
+      const priceId = PRICE_IDS[numericAmount];
+      if (!priceId) {
+        return NextResponse.json({ error: `Missing Stripe price configuration for €${numericAmount}.` }, { status: 500 });
+      }
+      lineItems = [{ price: priceId, quantity: 1 }];
     }
 
-    const stripe = new Stripe(secret);
+    const city = cleanHeader(request.headers.get("x-vercel-ip-city"));
+    const region = cleanHeader(request.headers.get("x-vercel-ip-country-region"));
+    const country = cleanHeader(request.headers.get("x-vercel-ip-country"));
+    const latitude = roundedCoordinate(request.headers.get("x-vercel-ip-latitude"));
+    const longitude = roundedCoordinate(request.headers.get("x-vercel-ip-longitude"));
 
-    // Vercel derives these values from the requester's public IP.
-    // We intentionally do NOT read or store the IP itself.
-    const city = safeDecode(request.headers.get("x-vercel-ip-city"));
-    const region = safeDecode(request.headers.get("x-vercel-ip-country-region"));
-    const country = safeDecode(request.headers.get("x-vercel-ip-country"));
-    const latitude = coarseCoord(request.headers.get("x-vercel-ip-latitude"));
-    const longitude = coarseCoord(request.headers.get("x-vercel-ip-longitude"));
+    const metadata = { project: "one-million-yes", city, region, country, latitude, longitude };
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
-      line_items: [{
-        price_data: {
-          currency: "eur",
-          unit_amount: 100,
-          product_data: {
-            name: "One Million Yes",
-            description: "One €1 yes in a global social experiment"
-          }
-        },
-        quantity: 1
-      }],
-      billing_address_collection: "auto",
+      line_items: lineItems,
       success_url: `${siteUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${siteUrl}/`,
-      metadata: {
-        project: "one-million-yes",
-        geo_city: city,
-        geo_region: region,
-        geo_country: country,
-        geo_lat: latitude,
-        geo_lon: longitude
-      }
+      cancel_url: `${siteUrl}/?checkout=cancelled`,
+      allow_promotion_codes: false,
+      billing_address_collection: "auto",
+      phone_number_collection: { enabled: false },
+      metadata,
+      payment_intent_data: { metadata },
     });
 
-    if (!session.url) {
-      return NextResponse.json({ error: "Stripe did not return a checkout URL." }, { status: 500 });
-    }
     return NextResponse.json({ url: session.url });
   } catch (error) {
-    console.error("checkout error", error);
-    return NextResponse.json({ error: "Could not create checkout." }, { status: 500 });
+    console.error("Stripe Checkout error:", error);
+    return NextResponse.json({ error: "Checkout could not be started." }, { status: 500 });
   }
 }
